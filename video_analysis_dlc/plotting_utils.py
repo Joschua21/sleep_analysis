@@ -1,12 +1,13 @@
+import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 import os
 
+
 try:
     import cv2
     import moviepy.editor as mpy
-    from moviepy.video.io.bindings import mplfig_to_npimage
     VIDEO_LIBS_AVAILABLE = True
 except ImportError:
     VIDEO_LIBS_AVAILABLE = False
@@ -28,11 +29,9 @@ def plot_speed(df_dlc, df_displacements, final_bodyparts_list, frame_rate, outpu
                                                     Set to 0 or None to disable smoothing. Defaults to 1.0.
     """
     print(f"\nGenerating speed plot... Individual parts: {plot_individual}, Smoothing: {smoothing_window_seconds}s")
-
+    fig, ax = plt.subplots(figsize=(15, 6))
     # Calculate time axis
     time_seconds = df_dlc.index / frame_rate
-
-    fig, ax = plt.subplots(figsize=(15, 6))
 
     # Plot Average Speed (potentially smoothed)
     if ('analysis', 'speed_pixels_per_second') in df_dlc.columns:
@@ -72,7 +71,7 @@ def plot_speed(df_dlc, df_displacements, final_bodyparts_list, frame_rate, outpu
     ax.set_title('Mouse Speed Over Time')
     ax.legend(loc='upper right')
     ax.grid(True, linestyle='--', alpha=0.6)
-
+    plt.tight_layout()
     # Save plot
     if save_plot:
         # Add suffix if smoothed
@@ -84,169 +83,174 @@ def plot_speed(df_dlc, df_displacements, final_bodyparts_list, frame_rate, outpu
         except Exception as e:
             print(f"Error saving plot: {e}")
 
-    # Explicitly display the plot
-    plt.show()
-
-    # Close the figure
-    plt.close(fig)
-
-
+    return fig
 
 
 def create_synced_video_with_plot(
     video_path: str,
-    speed_data: pd.Series, # The smoothed speed data (pixels/sec)
+    speed_data: pd.Series,
     frame_rate: float,
     output_video_path: str,
-    plot_width_seconds: float = 5.0, # How many seconds the plot window should show
-    plot_height_pixels: int = 200, # Height of the plot area
+    median_coords: pd.DataFrame = None, # New parameter for median coordinates
+    plot_width_seconds: float = 5.0,
+    plot_height_pixels: int = 200,
+    median_point_radius: int = 5, # Radius of the median point
+    median_point_color: tuple = (0, 0, 0) # Black color for the point (BGR for OpenCV)
 ):
-    """
-    Creates a video with the original video on top and a synchronized,
-    scrolling speed plot below.
-
-    Args:
-        video_path: Path to the original input video file.
-        speed_data: Pandas Series containing the smoothed speed data, indexed by frame number.
-        frame_rate: Frame rate of the video.
-        output_video_path: Path to save the combined output video.
-        plot_width_seconds: Duration (in seconds) the scrolling plot window should display.
-        plot_height_pixels: Height (in pixels) for the plot area.
-        smoothing_window_frames: The window size used to smooth the speed data.
-    """
     if not VIDEO_LIBS_AVAILABLE:
         print("Error: Cannot create video. Required libraries (moviepy, opencv-python) are missing.")
         return
 
-    print(f"Starting synchronized video creation: {output_video_path}")
-    # --- Implementation Details ---
-    # 1. Load the video clip using moviepy.VideoFileClip(video_path)
-    # 2. Get video properties: duration, width, height, fps. Ensure fps matches frame_rate.
-    # 3. Prepare speed data: Ensure it's aligned with frame numbers. Handle NaNs (e.g., fill with 0).
-    # 4. Calculate plot parameters:
-    #    - Plot width should match video width.
-    #    - Determine max speed for y-axis limit (add some padding).
-    #    - Calculate how many frames correspond to plot_width_seconds.
-    # 5. Define a function `make_plot_frame(t)`:
-    #    - This function is called by moviepy for each frame time `t`.
-    #    - Calculate the current frame index: `current_frame = int(t * frame_rate)`
-    #    - Determine the range of frames to display in the plot:
-    #      - `start_frame = max(0, current_frame - frames_in_plot_window)`
-    #      - `end_frame = current_frame`
-    #    - Select the speed data for this window: `speed_segment = speed_data[start_frame:end_frame]`
-    #    - Create a matplotlib figure and axes:
-    #      - Set x-limits from `start_frame / frame_rate` to `end_frame / frame_rate` (time in seconds).
-    #      - Set y-limits from 0 to max_speed.
-    #      - Plot the `speed_segment` against its corresponding time values.
-    #      - Add a vertical line or marker at the current time `t`.
-    #      - Customize plot appearance (labels, title, line color).
-    #    - Convert the matplotlib figure to a NumPy array image using `mplfig_to_npimage(fig)`.
-    #    - Close the figure (`plt.close(fig)`) to prevent memory leaks.
-    #    - Return the NumPy array image.
-    # 6. Create the plot clip: `plot_clip = mpy.VideoClip(make_plot_frame, duration=video_clip.duration)`
-    # 7. Resize the plot clip image width to match the video width, maintaining aspect ratio or using the specified plot_height_pixels. Use `plot_clip.resize(width=video_clip.width, height=plot_height_pixels)`.
-    # 8. Combine the clips vertically: `final_clip = mpy.clips_array([[video_clip], [plot_clip]])`
-    # 9. Write the final video: `final_clip.write_videofile(output_video_path, fps=frame_rate, codec='libx264')` # Choose appropriate codec
-    # 10. Close clips to release resources.
-    # --- End Implementation Details ---
+    print(f"Starting synchronized video creation with median point overlay: {output_video_path}")
+    original_backend = matplotlib.get_backend()
+    print(f"Original matplotlib backend: {original_backend}")
+    matplotlib.use('Agg') # Switch to a non-interactive backend for performance
+    print(f"Temporarily switched matplotlib backend to: Agg")
 
-    # Placeholder implementation (replace with actual moviepy code)
+    fig = None # Initialize fig to None for the finally block
+    video_clip_orig = None
+
     try:
-        # Load video
-        video_clip = mpy.VideoFileClip(video_path)
-        w, h = video_clip.w, video_clip.h
-        vid_duration = video_clip.duration
-        vid_fps = video_clip.fps
-        if abs(vid_fps - frame_rate) > 1: # Allow minor difference
-             print(f"Warning: Video FPS ({vid_fps}) differs significantly from specified frame_rate ({frame_rate}). Using video FPS.")
-             actual_frame_rate = vid_fps
+        video_clip_orig = mpy.VideoFileClip(video_path)
+        w, h = video_clip_orig.w, video_clip_orig.h
+        vid_duration = video_clip_orig.duration
+        vid_fps = video_clip_orig.fps
+
+        if abs(vid_fps - frame_rate) > 1:
+            print(f"Warning: Video FPS ({vid_fps}) differs significantly from specified frame_rate ({frame_rate}). Using video FPS.")
+            actual_frame_rate = vid_fps
         else:
-             actual_frame_rate = frame_rate # Use the one from analysis
+            actual_frame_rate = frame_rate
 
-        # Prepare data
-        speed_data_np = speed_data.fillna(0).to_numpy() # Fill NaNs for plotting
-        max_speed = np.nanmax(speed_data_np) * 1.1 # Add 10% padding
-        if max_speed == 0: max_speed = 100 # Avoid zero limit
+        # --- Prepare median coordinates if provided ---
+        median_x_np = None
+        median_y_np = None
+        if median_coords is not None and not median_coords.empty:
+            if ('analysis', 'median_x') in median_coords.columns and \
+               ('analysis', 'median_y') in median_coords.columns:
+                median_x_np = median_coords[('analysis', 'median_x')].to_numpy()
+                median_y_np = median_coords[('analysis', 'median_y')].to_numpy()
+                print("Median coordinates provided for overlay.")
+            else:
+                print("Warning: Median coordinates DataFrame provided but 'median_x' or 'median_y' columns are missing. No overlay will be drawn.")
+        else:
+            print("No median coordinates provided for overlay.")
 
-        # Plot parameters
+
+        # --- Function to draw median point on each frame ---
+        def draw_median_on_frame(get_frame, t):
+            frame_orig = get_frame(t) # Get the original frame
+            frame = frame_orig.copy() # <--- MAKE A WRITABLE COPY
+            current_frame_idx = int(t * actual_frame_rate)
+
+            if median_x_np is not None and median_y_np is not None and \
+               current_frame_idx < len(median_x_np) and current_frame_idx < len(median_y_np):
+                
+                mx = median_x_np[current_frame_idx]
+                my = median_y_np[current_frame_idx]
+
+                if not np.isnan(mx) and not np.isnan(my):
+                    center_coordinates = (int(mx), int(my))
+                    # Draw the circle. Note: frame is a NumPy array.
+                    # OpenCV uses BGR color format by default.
+                    try:
+                        cv2.circle(frame, center_coordinates, median_point_radius, median_point_color, -1) # -1 for filled circle
+                    except Exception as e_cv2:
+                        print(f"Error drawing circle at frame {current_frame_idx} time {t}: {e_cv2}")
+            return frame
+
+        # Apply the drawing function to the video clip
+        video_clip_processed = video_clip_orig.fl(draw_median_on_frame)
+        # --- End Median Point Drawing ---
+
+
+        speed_data_np = speed_data.fillna(0).to_numpy()
+        valid_speeds = speed_data_np[np.isfinite(speed_data_np)]
+
+        if len(valid_speeds) > 0:
+            max_s = np.max(valid_speeds) * 1.1 
+        else:
+            max_s = 0 # Fallback if no valid speed data
+        
+        if max_s == 0 or np.isnan(max_s) or not np.isfinite(max_s): # Ensure max_speed is a positive finite number
+            max_speed_for_plot = 100.0 # Default y-limit if max_s is problematic
+        else:
+            max_speed_for_plot = max_s
+
         frames_in_plot_window = int(plot_width_seconds * actual_frame_rate)
         time_per_frame = 1.0 / actual_frame_rate
 
-        # Matplotlib figure for reuse
-        fig, ax = plt.subplots(figsize=(w / 80, plot_height_pixels / 80), dpi=80) # Adjust figsize based on desired output pixels
+        fig, ax = plt.subplots(figsize=(w / 80, plot_height_pixels / 80), dpi=80)
+        line, = ax.plot([], [], color='r')
+        vline = ax.axvline(0, color='lime', linestyle='--', lw=1)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Speed (px/s)")
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_ylim(0, max_speed_for_plot)
+        fig.tight_layout(pad=0.5)
 
-        # Function to generate plot frame
         def make_plot_frame(t):
+            # ... (rest of make_plot_frame remains the same as your optimized version)
             current_frame = int(t * actual_frame_rate)
-            # Data fetching window remains the same (up to current time)
             start_frame_idx = max(0, current_frame - frames_in_plot_window)
-            end_frame_idx = current_frame + 1 # Include current frame
-
-            # Data segment for the plot window
+            end_frame_idx = current_frame + 1
             plot_data_segment = speed_data_np[start_frame_idx:end_frame_idx]
-            # Time axis for the data points being plotted
-            time_axis = np.arange(start_frame_idx, end_frame_idx) * time_per_frame
+            
+            # Ensure time_axis_segment aligns with plot_data_segment
+            # It should represent the actual time values for the x-axis of the plot window
+            time_axis_plot_window_data = np.arange(start_frame_idx, end_frame_idx) * time_per_frame
+            
+            line.set_data(time_axis_plot_window_data, plot_data_segment)
+            
+            # Current time marker position (this 't' is the video's current time)
+            vline.set_xdata([t, t])
+            
+            # Set x-axis limits for the scrolling window effect
+            # The window shows `plot_width_seconds` of data, with the current time 't' ideally at the right edge or slightly before.
+            plot_window_end_time = t + (time_per_frame * 5) # Show a little bit past current time for context
+            plot_window_start_time = max(0.0, plot_window_end_time - plot_width_seconds)
 
-            # Clear previous plot and redraw
-            ax.clear()
-            ax.plot(time_axis, plot_data_segment, color='r') # Plot data up to time t
-            ax.axvline(t, color='lime', linestyle='--', lw=1) # Line for current time t
-
-            # --- Adjust X-axis limits for the view ---
-            # Define the total width of the view (plot_width_seconds + buffer)
-            view_width_seconds = plot_width_seconds + 1.0
-            # Calculate the end time for the x-axis view (current time + buffer)
-            plot_end_time = t + 1.0
-            # Calculate the start time for the x-axis view
-            plot_start_time = max(0.0, plot_end_time - view_width_seconds)
-            # Special handling for the beginning: ensure the window width is maintained
-            if t < plot_width_seconds:
-                 plot_end_time = view_width_seconds # Keep the window fixed until t > plot_width_seconds
-
-            ax.set_xlim(plot_start_time, plot_end_time)
-            # --- End Adjust X-axis limits ---
-
-            ax.set_ylim(0, max_speed)
-            ax.set_xlabel("Time (s)")
-            ax.set_ylabel("Speed (px/s)")
-            ax.grid(True, linestyle=':', alpha=0.6)
-            fig.tight_layout(pad=0.5) # Adjust padding
-
-            fig.canvas.draw()
-            # Get the RGBA buffer from the figure
+            # Adjust if current time t is less than the plot_width_seconds
+            if t < plot_width_seconds - (time_per_frame * 5) : # Ensure the window starts at 0 if t is too small
+                plot_window_start_time = 0.0
+                plot_window_end_time = plot_width_seconds
+            
+            ax.set_xlim(plot_window_start_time, plot_window_end_time)
+            
+            fig.canvas.draw() # This is the expensive call
             img_buf = fig.canvas.buffer_rgba()
-            # Convert the buffer to a numpy array
             img = np.frombuffer(img_buf, dtype=np.uint8)
-            # Reshape the array to (height, width, 4)
             img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-            # Return the image array (moviepy usually handles RGB or RGBA)
-            return img[:, :, :3] # Return RGB
-        # Create the plot video clip
-        plot_clip = mpy.VideoClip(make_plot_frame, duration=vid_duration)
+            return img[:, :, :3]
 
-        # Ensure plot clip has correct dimensions before combining
+        plot_clip = mpy.VideoClip(make_plot_frame, duration=vid_duration)
         plot_clip = plot_clip.resize(newsize=(w, plot_height_pixels))
 
-        # Combine video and plot
-        final_clip = mpy.clips_array([[video_clip], [plot_clip]])
+        # Use the processed video clip (with median point) here
+        final_clip = mpy.clips_array([[video_clip_processed], [plot_clip]])
 
-        # Write the output video
         print(f"Writing final video to {output_video_path}...")
-        final_clip.write_videofile(output_video_path, fps=actual_frame_rate, codec='libx264', audio=False, threads=4, logger='bar') # Suppress audio, use multiple threads
+        # ... (write_videofile call remains the same, consider the h264_nvenc option)
+        try:
+            final_clip.write_videofile(
+                output_video_path, fps=actual_frame_rate, codec='h264_nvenc', audio=False,
+                threads=4, preset='fast', logger='bar'
+            )
+            print("Video encoding with h264_nvenc successful.")
+        except Exception as e_nvenc:
+            print(f"Warning: h264_nvenc encoding failed ({e_nvenc}). Falling back to libx264.")
+            final_clip.write_videofile(
+                output_video_path, fps=actual_frame_rate, codec='libx264', audio=False,
+                threads=4, preset='ultrafast', logger='bar'
+            )
 
-        # Close resources
         plt.close(fig)
-        video_clip.close()
-        plot_clip.close()
-        final_clip.close()
+        video_clip_orig.close() # Close the original video clip
+        # video_clip_processed doesn't need explicit close if it's just a result of .fl()
         print("Video creation complete.")
 
     except Exception as e:
         print(f"Error during video creation: {e}")
-        # Ensure figure is closed if error occurs
         if 'fig' in locals() and plt.fignum_exists(fig.number):
-             plt.close(fig)
-        # Close clips if they were opened
-        if 'video_clip' in locals(): video_clip.close()
-        if 'plot_clip' in locals(): plot_clip.close()
-        if 'final_clip' in locals(): final_clip.close()
+            plt.close(fig)
+        if 'video_clip_orig' in locals() and hasattr(video_clip_orig, 'close'): video_clip_orig.close()
