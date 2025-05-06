@@ -1,9 +1,11 @@
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.figure import Figure
 import pandas as pd
 import numpy as np
 import os
-
+import colorsys
 
 try:
     import cv2
@@ -254,3 +256,247 @@ def create_synced_video_with_plot(
         if 'fig' in locals() and plt.fignum_exists(fig.number):
             plt.close(fig)
         if 'video_clip_orig' in locals() and hasattr(video_clip_orig, 'close'): video_clip_orig.close()
+
+
+# Video conversion for adding sleep bout periods and changes in arousal
+
+def create_synced_video_with_sleep_analysis(
+    video_path: str,
+    speed_data: pd.Series,
+    frame_rate: float,
+    output_video_path: str,
+    df_sleep_bouts: pd.DataFrame,  # New parameter for sleep bout information
+    median_coords: pd.DataFrame = None,
+    plot_width_seconds: float = 5.0,
+    plot_height_pixels: int = 200,
+    median_point_radius: int = 5,
+    median_point_color: tuple = (0, 0, 255),  # Red color (BGR for OpenCV)
+    sleep_threshold: float = 75.0,  # Speed threshold for sleep
+    arousal_low_threshold: float = 30.0,  # Lower threshold for arousal
+    arousal_high_threshold: float = 40.0  # Higher threshold for arousal
+):
+    """
+    Create a synchronized video with sleep analysis visualization.
+    - Marks sleep periods (speed < sleep_threshold) with light green background
+    - Changes line color based on arousal state:
+      * Blue during sleep periods (< arousal_low_threshold)
+      * Yellow-blue gradient when between arousal_low_threshold and arousal_high_threshold
+      * Red-yellow gradient when between arousal_high_threshold and sleep_threshold
+      * Black when not in sleep periods
+    """
+    if not VIDEO_LIBS_AVAILABLE:
+        print("Error: Cannot create video. Required libraries (moviepy, opencv-python) are missing.")
+        return
+
+    print(f"Starting synchronized video creation with sleep analysis: {output_video_path}")
+    original_backend = matplotlib.get_backend()
+    print(f"Original matplotlib backend: {original_backend}")
+    matplotlib.use('Agg')  # Switch to a non-interactive backend for performance
+    print(f"Temporarily switched matplotlib backend to: Agg")
+
+    fig = None  # Initialize fig to None for the finally block
+    video_clip_orig = None
+
+    try:
+        video_clip_orig = mpy.VideoFileClip(video_path)
+        w, h = video_clip_orig.w, video_clip_orig.h
+        vid_duration = video_clip_orig.duration
+        vid_fps = video_clip_orig.fps
+
+        if abs(vid_fps - frame_rate) > 1:
+            print(f"Warning: Video FPS ({vid_fps}) differs significantly from specified frame_rate ({frame_rate}). Using video FPS.")
+            actual_frame_rate = vid_fps
+        else:
+            actual_frame_rate = frame_rate
+
+        # --- Prepare median coordinates if provided ---
+        median_x_np = None
+        median_y_np = None
+        if median_coords is not None and not median_coords.empty:
+            if ('analysis', 'median_x') in median_coords.columns and \
+               ('analysis', 'median_y') in median_coords.columns:
+                median_x_np = median_coords[('analysis', 'median_x')].to_numpy()
+                median_y_np = median_coords[('analysis', 'median_y')].to_numpy()
+                print("Median coordinates provided for overlay.")
+            else:
+                print("Warning: Median coordinates DataFrame provided but 'median_x' or 'median_y' columns are missing. No overlay will be drawn.")
+        else:
+            print("No median coordinates provided for overlay.")
+
+        # --- Prepare sleep bouts data ---
+        sleep_periods = []
+        if df_sleep_bouts is not None and not df_sleep_bouts.empty:
+            for _, bout in df_sleep_bouts.iterrows():
+                sleep_periods.append((bout['start_time_s'], bout['end_time_s']))
+            print(f"Added {len(sleep_periods)} sleep periods for visualization.")
+        else:
+            print("No sleep periods data provided.")
+
+        # --- Function to draw median point on each frame ---
+        def draw_median_on_frame(get_frame, t):
+            frame_orig = get_frame(t)  # Get the original frame
+            frame = frame_orig.copy()  # Make a writable copy
+            current_frame_idx = int(t * actual_frame_rate)
+
+            if median_x_np is not None and median_y_np is not None and \
+               current_frame_idx < len(median_x_np) and current_frame_idx < len(median_y_np):
+                
+                mx = median_x_np[current_frame_idx]
+                my = median_y_np[current_frame_idx]
+
+                if not np.isnan(mx) and not np.isnan(my):
+                    center_coordinates = (int(mx), int(my))
+                    # Draw the circle
+                    try:
+                        cv2.circle(frame, center_coordinates, median_point_radius, median_point_color, -1)
+                    except Exception as e_cv2:
+                        print(f"Error drawing circle at frame {current_frame_idx} time {t}: {e_cv2}")
+            return frame
+
+        # Apply the drawing function to the video clip
+        video_clip_processed = video_clip_orig.fl(draw_median_on_frame)
+
+        speed_data_np = speed_data.fillna(0).to_numpy()
+        valid_speeds = speed_data_np[np.isfinite(speed_data_np)]
+
+        if len(valid_speeds) > 0:
+            max_s = np.max(valid_speeds) * 1.1 
+        else:
+            max_s = 0  # Fallback if no valid speed data
+        
+        if max_s == 0 or np.isnan(max_s) or not np.isfinite(max_s):
+            max_speed_for_plot = 100.0  # Default y-limit if max_s is problematic
+        else:
+            max_speed_for_plot = max_s
+
+        frames_in_plot_window = int(plot_width_seconds * actual_frame_rate)
+        time_per_frame = 1.0 / actual_frame_rate
+
+        fig, ax = plt.subplots(figsize=(w / 80, plot_height_pixels / 80), dpi=80)
+        line, = ax.plot([], [], color='k')  # Start with black line
+        vline = ax.axvline(0, color='lime', linestyle='--', lw=1)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Speed (px/s)")
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_ylim(0, max_speed_for_plot)
+        
+        # Add threshold lines
+        ax.axhline(sleep_threshold, color='r', linestyle='--', lw=0.5, alpha=0.5)
+        ax.axhline(arousal_high_threshold, color='orange', linestyle=':', lw=0.5, alpha=0.5)
+        ax.axhline(arousal_low_threshold, color='y', linestyle=':', lw=0.5, alpha=0.5)
+        
+        fig.tight_layout(pad=0.5)
+
+        # Helper function to check if time is in sleep period
+        def is_in_sleep_period(t):
+            for start, end in sleep_periods:
+                if start <= t < end:
+                    return True
+            return False
+        
+        # Helper function to determine color based on speed and sleep state
+        def get_line_color(t, speed_value):
+            if not is_in_sleep_period(t):
+                return 'black'
+            
+            # In sleep period
+            if speed_value < arousal_low_threshold:
+                return 'blue'  # Base sleep color
+            elif speed_value < arousal_high_threshold:
+                # Gradient from blue to yellow based on position between thresholds
+                ratio = (speed_value - arousal_low_threshold) / (arousal_high_threshold - arousal_low_threshold)
+                # Mix blue (0,0,1) and yellow (1,1,0)
+                r = ratio
+                g = ratio
+                b = 1 - ratio
+                return (r, g, b)
+            elif speed_value < sleep_threshold:
+                # Gradient from yellow to red based on position between thresholds
+                ratio = (speed_value - arousal_high_threshold) / (sleep_threshold - arousal_high_threshold)
+                # Mix yellow (1,1,0) and red (1,0,0)
+                r = 1.0
+                g = 1.0 - ratio
+                b = 0
+                return (r, g, b)
+            else:
+                return 'black'  # Default case
+        
+        # Spans for sleep periods (created once)
+        sleep_spans = []
+        for start, end in sleep_periods:
+            span = ax.axvspan(start, end, color='palegreen', alpha=0.3, zorder=0)
+            sleep_spans.append(span)
+
+        def make_plot_frame(t):
+            current_frame = int(t * actual_frame_rate)
+            start_frame_idx = max(0, current_frame - frames_in_plot_window)
+            end_frame_idx = current_frame + 1
+            plot_data_segment = speed_data_np[start_frame_idx:end_frame_idx]
+            
+            time_axis_plot_window_data = np.arange(start_frame_idx, end_frame_idx) * time_per_frame
+            
+            # Determine if current time is in sleep period for coloring
+            in_sleep = is_in_sleep_period(t)
+            
+            # Set up plot window limits
+            plot_window_end_time = t + (time_per_frame * 5)
+            plot_window_start_time = max(0.0, plot_window_end_time - plot_width_seconds)
+            
+            # Adjust if current time t is less than plot_width_seconds
+            if t < plot_width_seconds - (time_per_frame * 5):
+                plot_window_start_time = 0.0
+                plot_window_end_time = plot_width_seconds
+            
+            ax.set_xlim(plot_window_start_time, plot_window_end_time)
+            
+            # Set line data
+            line.set_data(time_axis_plot_window_data, plot_data_segment)
+            
+            # Update line color based on current speed and sleep state
+            current_speed = speed_data_np[current_frame] if current_frame < len(speed_data_np) else 0
+            line.set_color(get_line_color(t, current_speed))
+            
+            # Update current time marker
+            vline.set_xdata([t, t])
+            
+            fig.canvas.draw()
+            img_buf = fig.canvas.buffer_rgba()
+            img = np.frombuffer(img_buf, dtype=np.uint8)
+            img = img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+            return img[:, :, :3]
+
+        plot_clip = mpy.VideoClip(make_plot_frame, duration=vid_duration)
+        plot_clip = plot_clip.resize(newsize=(w, plot_height_pixels))
+
+        # Use the processed video clip (with median point)
+        final_clip = mpy.clips_array([[video_clip_processed], [plot_clip]])
+
+        print(f"Writing final video to {output_video_path}...")
+        try:
+            final_clip.write_videofile(
+                output_video_path, fps=actual_frame_rate, codec='h264_nvenc', audio=False,
+                threads=4, preset='fast', logger='bar'
+            )
+            print("Video encoding with h264_nvenc successful.")
+        except Exception as e_nvenc:
+            print(f"Warning: h264_nvenc encoding failed ({e_nvenc}). Falling back to libx264.")
+            final_clip.write_videofile(
+                output_video_path, fps=actual_frame_rate, codec='libx264', audio=False,
+                threads=4, preset='ultrafast', logger='bar'
+            )
+
+        plt.close(fig)
+        video_clip_orig.close()
+        print("Video creation with sleep analysis complete.")
+
+    except Exception as e:
+        print(f"Error during video creation: {e}")
+        import traceback
+        traceback.print_exc()
+        if 'fig' in locals() and plt.fignum_exists(fig.number):
+            plt.close(fig)
+        if 'video_clip_orig' in locals() and hasattr(video_clip_orig, 'close'):
+            video_clip_orig.close()
+    finally:
+        matplotlib.use(original_backend)  # Restore the original matplotlib backend
+        print(f"Restored matplotlib backend to: {original_backend}")
