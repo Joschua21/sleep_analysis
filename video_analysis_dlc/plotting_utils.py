@@ -31,7 +31,7 @@ def plot_speed(df_dlc, df_displacements, final_bodyparts_list, frame_rate, outpu
                                                     Set to 0 or None to disable smoothing. Defaults to 1.0.
     """
     print(f"\nGenerating speed plot... Individual parts: {plot_individual}, Smoothing: {smoothing_window_seconds}s")
-    fig, ax = plt.subplots(figsize=(15, 6))
+    fig, ax = plt.subplots(figsize=(8, 3))
     # Calculate time axis
     time_seconds = df_dlc.index / frame_rate
 
