@@ -17,6 +17,45 @@ except ImportError:
     print("Install them using: pip install moviepy opencv-python")
 
 
+
+def interpolate_gaps_conditionally(series: pd.Series, max_gap_length: int) -> pd.Series:
+    """
+    Interpolates NaN values in a Series using linear interpolation, but only
+    if the consecutive NaN gap is shorter than or equal to max_gap_length.
+
+    Args:
+        series (pd.Series): The input Series with potential NaNs.
+        max_gap_length (int): The maximum length of a NaN gap to interpolate.
+
+    Returns:
+        pd.Series: Series with short NaN gaps interpolated.
+    """
+    s_out = series.copy()
+    is_na = s_out.isna()
+
+    if not is_na.any(): # No NaNs, nothing to do
+        return s_out
+
+    # Identify groups of consecutive NaNs
+    na_group_ids = is_na.ne(is_na.shift()).cumsum()
+
+    # Iterate over each NaN block
+    # We are interested in the groups that are True (i.e., are NaN blocks)
+    for group_id, na_block_series in s_out[is_na].groupby(na_group_ids[is_na]):
+        if not na_block_series.empty and len(na_block_series) <= max_gap_length:
+            # This block of NaNs is short enough to interpolate.
+            # We perform a full interpolation on the original series (s_out)
+            # to get the correct values based on surrounding non-NaNs,
+            # and then apply these interpolated values only to the current short gap.
+            
+            # Temporarily interpolate the whole series to get potential values
+            temp_interpolated_series = s_out.interpolate(method='linear', limit_direction='both')
+            
+            # Copy values from temp_interpolated_series to s_out *only* for this short gap's indices
+            s_out.loc[na_block_series.index] = temp_interpolated_series.loc[na_block_series.index]
+            
+    return s_out
+
 # Add smoothing_window_seconds parameter
 def plot_speed(df_dlc, df_displacements, final_bodyparts_list, frame_rate, output_dir, base_filename, plot_individual=True, save_plot=True, smoothing_window_seconds=1.0):
     """
@@ -500,3 +539,104 @@ def create_synced_video_with_sleep_analysis(
     finally:
         matplotlib.use(original_backend)  # Restore the original matplotlib backend
         print(f"Restored matplotlib backend to: {original_backend}")
+
+def plot_body_posture_metric(
+    df_dlc,
+    metric_column_tuple, # e.g., ('analysis', 'avg_dist_to_median')
+    frame_rate,
+    output_dir_path,     # Renamed from output_dir for consistency
+    base_output_name,    # Renamed from base_filename for consistency
+    save_plot=True,
+    display_plot=True,
+    smoothing_window_seconds_metric=0.25, # Default smoothing for the new metric
+    plot_with_speed=True,
+    speed_column_tuple=('analysis', 'speed_pixels_per_second'),
+    smoothing_window_seconds_speed=0.25  # Default smoothing for speed on this plot
+):
+    """
+    Plots a calculated body posture metric (e.g., average distance of bodyparts to median)
+    over time, optionally with speed on a secondary axis.
+
+    Args:
+        df_dlc (pd.DataFrame): DataFrame containing the analysis data.
+        metric_column_tuple (tuple): Tuple identifying the metric column, e.g., ('analysis', 'avg_dist_to_median').
+        frame_rate (float): Video frame rate in FPS.
+        output_dir_path (str): Path to the directory where the plot will be saved.
+        base_output_name (str): Base name for the output plot file.
+        save_plot (bool): Whether to save the plot.
+        display_plot (bool): Whether to display the plot.
+        smoothing_window_seconds_metric (float): Smoothing window in seconds for the posture metric. 0 for no smoothing.
+        plot_with_speed (bool): Whether to plot speed on a secondary y-axis.
+        speed_column_tuple (tuple): Tuple identifying the speed column if plotting with speed.
+        smoothing_window_seconds_speed (float): Smoothing window in seconds for the speed trace. 0 for no smoothing.
+    """
+    if metric_column_tuple not in df_dlc.columns:
+        print(f"Error: Metric column {metric_column_tuple} not found in DataFrame.")
+        if display_plot: # Avoids error if plt is not meant to be shown
+             plt.close(plt.gcf()) if plt.get_fignums() else None
+        return
+
+    fig, ax1 = plt.subplots(figsize=(15, 6))
+    time_axis_seconds = df_dlc.index / frame_rate
+
+    # --- Plot Body Posture Metric ---
+    metric_data = df_dlc[metric_column_tuple].copy()
+    if smoothing_window_seconds_metric > 0 and frame_rate > 0:
+        smoothing_window_frames = int(smoothing_window_seconds_metric * frame_rate)
+        if smoothing_window_frames < 1:
+            smoothing_window_frames = 1
+        metric_data_smoothed = metric_data.rolling(window=smoothing_window_frames, min_periods=1, center=True).mean()
+        label_metric = f'Smoothed {metric_column_tuple[-1]} ({smoothing_window_seconds_metric}s window)'
+    else:
+        metric_data_smoothed = metric_data
+        label_metric = f'{metric_column_tuple[-1]} (px)'
+
+    color_metric = 'tab:red'
+    ax1.set_xlabel('Time (seconds)')
+    ax1.set_ylabel(f'{metric_column_tuple[-1]} (pixels)', color=color_metric)
+    ax1.plot(time_axis_seconds, metric_data_smoothed, color=color_metric, label=label_metric, lw=1.5)
+    ax1.tick_params(axis='y', labelcolor=color_metric)
+    ax1.grid(True, linestyle=':', alpha=0.6)
+
+    lines, labels = ax1.get_legend_handles_labels()
+
+    if plot_with_speed and speed_column_tuple in df_dlc.columns:
+        ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+        speed_data = df_dlc[speed_column_tuple].copy()
+
+        if smoothing_window_seconds_speed > 0 and frame_rate > 0:
+            smoothing_window_frames_speed = int(smoothing_window_seconds_speed * frame_rate)
+            if smoothing_window_frames_speed < 1:
+                smoothing_window_frames_speed = 1
+            speed_data_smoothed = speed_data.rolling(window=smoothing_window_frames_speed, min_periods=1, center=True).mean()
+            label_speed = f'Smoothed Speed ({smoothing_window_seconds_speed}s window)'
+        else:
+            speed_data_smoothed = speed_data
+            label_speed = 'Speed (px/s)'
+
+        color_speed = 'tab:blue'
+        ax2.set_ylabel('Speed (pixels/second)', color=color_speed)
+        ax2.plot(time_axis_seconds, speed_data_smoothed, color=color_speed, label=label_speed, lw=1, alpha=0.8)
+        ax2.tick_params(axis='y', labelcolor=color_speed)
+        
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        lines += lines2
+        labels += labels2
+    
+    fig.suptitle('Body Posture Metric and Speed Over Time', fontsize=14) # Changed title to suptitle
+    ax1.legend(lines, labels, loc='upper left')
+    fig.tight_layout(rect=[0, 0, 1, 0.96]) # Adjust layout to make space for suptitle
+
+
+    if save_plot:
+        plot_filename = os.path.join(output_dir_path, base_output_name + '_body_posture_metric.png')
+        try:
+            plt.savefig(plot_filename, dpi=300)
+            print(f"Body posture metric plot saved to: {plot_filename}")
+        except Exception as e:
+            print(f"Error saving body posture metric plot: {e}")
+
+    if display_plot:
+        plt.show()
+    else:
+        plt.close(fig)
