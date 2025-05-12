@@ -18,3 +18,5 @@ pip install deeplabcut==2.3.9 "tensorpack>=0.11" "tf_slim>=1.1.0"
 conda install -c conda-forge notebook ipykernel
 
 python -m ipykernel install --user --name=DEEPLABCUT_TF_2 --display-name="Python (DLC_TF_2)"
+
+while ($true){ cls; nvidia-smi; Start-Sleep -Seconds 1 }

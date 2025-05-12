@@ -1692,3 +1692,356 @@ def generate_sleep_analysis_video(df_dlc, df_midpoints_pca_raw, sleep_bouts_dict
         import traceback
         traceback.print_exc()
         return None
+    
+def main(input_dir, params=None):
+    """
+    Run the complete sleep analysis pipeline on a single directory.
+    
+    Args:
+        input_dir: Path to the directory containing the DLC CSV file and video
+        params: Optional dictionary of analysis parameters
+    
+    Returns:
+        bool: True if analysis completed successfully, False otherwise
+    """
+    print(f"\n{'='*80}\nProcessing directory: {input_dir}\n{'='*80}")
+    
+    try:
+        # Set default parameters
+        default_params = {
+            'frame_rate': 60,
+            'likelihood_threshold': 0.95,
+            'sleep_speed_threshold': 60.0,
+            'posture_change_threshold': 60.0,
+            'angular_velocity_threshold': 50.0,
+            'min_sleep_duration_seconds': 10,
+            'save_plots': True
+        }
+        
+        # Override with user-provided parameters if any
+        if params:
+            default_params.update(params)
+            
+        # Use the updated parameters
+        params = default_params
+        print("Running with parameters:")
+        for key, value in params.items():
+            print(f"  {key}: {value}")
+            
+        # 1. Setup output directory
+        output_dir = setup_directories(input_dir)
+        print(f'Output directory: {output_dir}')
+        
+        # 2. Find input files
+        csv_file, video_file = find_files(input_dir)
+        if csv_file is None:
+            print("Error: No CSV file found. Skipping directory.")
+            return False
+            
+        print(f"Found CSV file: {csv_file}")
+        if video_file:
+            print(f"Found video file: {video_file}")
+        else:
+            print("No video file found")
+        
+        # 3. Load DLC data
+        df_dlc = load_dlc_data(csv_file)
+        print(f"DLC data loaded: {df_dlc.shape[0]} rows, {len(df_dlc.columns)} columns")
+        
+        # 4. Get default bodyparts list
+        default_bodyparts = get_default_bodyparts()
+        
+        # 5. Use select_available_bodyparts to find which bodyparts are available
+        final_bodyparts_list = select_available_bodyparts(df_dlc, default_bodyparts)
+        print(f"Final bodyparts list for analysis: {final_bodyparts_list}")
+        
+        # 6. Process coordinates
+        df_dlc, filtered_x_coords, filtered_y_coords = process_bodypart_coordinates(
+            df_dlc, final_bodyparts_list, params['likelihood_threshold']
+        )
+        print("Coordinate processing complete")
+        
+        # 7. Calculate speed
+        file_name = os.path.basename(csv_file)
+        df_dlc = calculate_speed(
+            df_dlc, params['frame_rate'], output_dir, file_name, 
+            final_bodyparts_list, save_plots=params['save_plots']
+        )
+        print("Speed calculation complete")
+        
+        # 8. Calculate body posture metric
+        df_dlc = calculate_body_posture_metric(
+            df_dlc, filtered_x_coords, filtered_y_coords, 
+            final_bodyparts_list, output_dir, file_name, 
+            save_plots=params['save_plots']
+        )
+        print("Body posture analysis complete")
+        
+        # 9. Calculate body movement derivative
+        df_dlc = calculate_body_movement_derivative(
+            df_dlc, params['frame_rate'], output_dir, file_name, 
+            save_plots=params['save_plots']
+        )
+        print("Body movement derivative analysis complete")
+        
+        # 10. Prepare coordinates for body axis calculation
+        bodypart_coordinate_sets = prepare_body_axis_coordinates(
+            df_dlc, filtered_x_coords, filtered_y_coords, final_bodyparts_list
+        )
+        print("Body axis coordinate preparation complete")
+        
+        # 11. Calculate body axis PCA
+        df_dlc, df_midpoints_pca_raw = calculate_body_axis_pca(df_dlc, bodypart_coordinate_sets)
+        print("Body axis PCA calculation complete")
+        
+        # 12. Calculate the body axis angles and create polar plot
+        df_dlc = calculate_and_plot_body_axis_angles(
+            df_dlc, df_midpoints_pca_raw, filtered_x_coords, filtered_y_coords,
+            params['frame_rate'], output_dir, file_name, save_plots=params['save_plots']
+        )
+        print("Body axis angle analysis complete")
+        
+        # 13. Calculate and plot smoothed body axis angles
+        df_dlc = plot_smoothed_body_axis_angles(
+            df_dlc, df_midpoints_pca_raw, params['frame_rate'], 
+            output_dir, file_name, save_plots=params['save_plots']
+        )
+        print("Smoothed body axis angle analysis complete")
+        
+        # 14. Calculate angular velocity from smoothed body axis angles
+        df_dlc = calculate_angular_velocity(
+            df_dlc, df_midpoints_pca_raw, params['frame_rate'], 
+            output_dir, file_name, save_plots=params['save_plots']
+        )
+        print("Angular velocity analysis complete")
+        
+        # 15. Identify sleep bouts across all metrics
+        df_dlc, sleep_bouts_dict = identify_sleep_bouts_and_plot(
+            df_dlc, df_midpoints_pca_raw, params['frame_rate'], 
+            output_dir, file_name, save_plots=params['save_plots']
+        )
+        print("Sleep analysis complete")
+        
+        # 16. Generate comprehensive video if available
+        if video_file:
+            video_path = generate_sleep_analysis_video(
+                df_dlc=df_dlc,
+                df_midpoints_pca_raw=df_midpoints_pca_raw,
+                sleep_bouts_dict=sleep_bouts_dict,
+                smoothed_speed=df_dlc[('analysis', 'speed_smoothed')],
+                body_movement_derivative=df_dlc[('analysis', 'posture_metric_abs_derivative')],
+                angular_velocity=df_dlc[('analysis', 'absolute_angular_velocity')],
+                smoothed_angle=df_midpoints_pca_raw['angle_y_deg_midpoints_pca_smoothed'],
+                frame_rate=params['frame_rate'],
+                video_file=video_file,
+                output_dir=output_dir,
+                file_name=file_name,
+                bodypart_coordinate_sets=bodypart_coordinate_sets,
+                thresholds={
+                    'speed': params['sleep_speed_threshold'],
+                    'posture': params['posture_change_threshold'],
+                    'angular': params['angular_velocity_threshold']
+                }
+            )
+            
+            if video_path:
+                print("Video generation complete.")
+            else:
+                print("Video generation failed but continuing with analysis.")
+        else:
+            print("No video file found for analysis. Skipping video generation.")
+        
+        # 17. Save the final results
+        final_output_csv = os.path.join(output_dir, f"{os.path.splitext(file_name)[0]}_final_results.csv")
+        df_dlc.to_csv(final_output_csv)
+        print(f"Final results saved to: {final_output_csv}")
+        
+        print(f"\n{'='*80}\nAnalysis of {input_dir} completed successfully\n{'='*80}")
+        return True
+        
+    except Exception as e:
+        print(f"\nERROR: Analysis failed for {input_dir}")
+        print(f"Error details: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def parse_config_file(config_file):
+    """
+    Parse a JSON configuration file containing parameters for each directory.
+    
+    Args:
+        config_file: Path to the JSON configuration file
+        
+    Returns:
+        dict: Dictionary mapping directory paths to parameter dictionaries
+    """
+    import json
+    
+    try:
+        with open(config_file, 'r') as f:
+            config = json.load(f)
+        
+        # Validate the config format
+        if not isinstance(config, dict):
+            print(f"Error: Config file should contain a JSON object/dictionary")
+            return {}
+            
+        # Convert all paths to absolute paths if they're relative
+        config_with_abs_paths = {}
+        for dir_path, params in config.items():
+            abs_path = os.path.abspath(dir_path)
+            config_with_abs_paths[abs_path] = params
+            
+        return config_with_abs_paths
+        
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON config file: {e}")
+        return {}
+    except Exception as e:
+        print(f"Error reading config file: {e}")
+        return {}
+
+
+def batch_process(input_config, pause_seconds=2):
+    """
+    Process multiple directories with individual parameters based on a config file.
+    
+    Args:
+        input_config: Either a list of directories (using default parameters) or
+                     a path to a JSON config file with directory-specific parameters
+        pause_seconds: Number of seconds to pause between directories
+    
+    Returns:
+        tuple: (list of successful directories, list of failed directories)
+    """
+    import time
+    
+    successful = []
+    failed = []
+    directory_params = {}
+    
+    # Check if input_config is a config file path or a list of directories
+    if isinstance(input_config, str) and os.path.isfile(input_config):
+        # It's a file, check if it's a JSON config file or a directory list
+        if input_config.lower().endswith('.json'):
+            # Parse the JSON config file
+            directory_params = parse_config_file(input_config)
+            if not directory_params:
+                print("Error parsing config file or empty config. Aborting.")
+                return [], []
+        else:
+            # Assume it's a simple list of directories
+            with open(input_config, 'r') as f:
+                directories = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            # Use default parameters for all directories
+            directory_params = {os.path.abspath(d): None for d in directories}
+    elif isinstance(input_config, list):
+        # It's already a list of directories
+        directory_params = {os.path.abspath(d): None for d in input_config}
+    else:
+        print(f"Error: Invalid input_config format. Expected a file path or list of directories.")
+        return [], []
+    
+    total_dirs = len(directory_params)
+    print(f"\nBatch processing {total_dirs} directories...")
+    
+    for i, (directory, params) in enumerate(directory_params.items()):
+        print(f"\nProcessing directory {i+1} of {total_dirs}: {directory}")
+        try:
+            # Ensure the directory exists
+            if not os.path.isdir(directory):
+                print(f"Directory does not exist: {directory}")
+                failed.append(directory)
+                continue
+                
+            success = main(directory, params)
+            if success:
+                successful.append(directory)
+            else:
+                failed.append(directory)
+                
+            # Pause between directories to let any file operations complete
+            if i < total_dirs - 1 and pause_seconds > 0:
+                print(f"Pausing for {pause_seconds} seconds before next directory...")
+                time.sleep(pause_seconds)
+                
+        except Exception as e:
+            print(f"Unexpected error processing directory {directory}: {str(e)}")
+            failed.append(directory)
+    
+    # Print summary
+    print("\n" + "="*80)
+    print(f"BATCH PROCESSING COMPLETE: {len(successful)}/{total_dirs} directories processed successfully")
+    
+    if failed:
+        print(f"\nFailed directories ({len(failed)}):")
+        for dir_path in failed:
+            print(f"  - {dir_path}")
+    
+    return successful, failed
+
+
+if __name__ == "__main__":
+    import argparse
+    import time
+    import sys
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Run sleep analysis pipeline on DLC data')
+    
+    # Required arguments
+    parser.add_argument('input', help='Input directory, text file with directory list, or JSON config file')
+    
+    # Optional arguments
+    parser.add_argument('--frame-rate', type=int, default=60, help='Video frame rate (default: 60)')
+    parser.add_argument('--likelihood-threshold', type=float, default=0.95, help='DLC likelihood threshold (default: 0.95)')
+    parser.add_argument('--speed-threshold', type=float, default=60.0, help='Sleep speed threshold (default: 60.0 px/s)')
+    parser.add_argument('--posture-threshold', type=float, default=60.0, help='Posture change threshold (default: 60.0 px/s)')
+    parser.add_argument('--angular-threshold', type=float, default=50.0, help='Angular velocity threshold (default: 50.0 deg/s)')
+    parser.add_argument('--min-sleep', type=float, default=10.0, help='Minimum sleep bout duration (default: 10.0 s)')
+    parser.add_argument('--no-plots', action='store_true', help='Disable plot generation')
+    parser.add_argument('--pause', type=int, default=2, help='Seconds to pause between batch directories (default: 2)')
+    
+    args = parser.parse_args()
+    
+    # Prepare default parameters (used for single directories or when config doesn't specify)
+    params = {
+        'frame_rate': args.frame_rate,
+        'likelihood_threshold': args.likelihood_threshold,
+        'sleep_speed_threshold': args.speed_threshold,
+        'posture_change_threshold': args.posture_threshold,
+        'angular_velocity_threshold': args.angular_threshold,
+        'min_sleep_duration_seconds': args.min_sleep,
+        'save_plots': not args.no_plots
+    }
+    
+    start_time = time.time()
+    
+    # Check if input is a directory or a file
+    if os.path.isdir(args.input):
+        # Single directory mode
+        success = main(args.input, params)
+        if success:
+            print("\nAnalysis completed successfully!")
+        else:
+            print("\nAnalysis failed.")
+            sys.exit(1)
+    elif os.path.isfile(args.input):
+        # Batch mode - could be a list of directories or a JSON config
+        successful, failed = batch_process(args.input, args.pause)
+        
+        if failed:
+            print("\nSome directories failed. Check the output for details.")
+            sys.exit(1)
+        else:
+            print("\nAll directories processed successfully!")
+    else:
+        print(f"Error: Input '{args.input}' is neither a directory nor a valid file.")
+        sys.exit(1)
+    
+    elapsed_time = time.time() - start_time
+    hours, remainder = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"\nTotal processing time: {int(hours)}h {int(minutes)}m {seconds:.1f}s")
